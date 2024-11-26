@@ -1,0 +1,43 @@
+name: Recreate Vectorize Database
+
+on:
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  recreate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install Wrangler
+        run: npm install -g wrangler@latest
+
+      - name: Login to Cloudflare
+        run: echo ${{ secrets.CLOUDFLARE_API_TOKEN }} > ~/.wrangler/config/default.toml
+
+      - name: Check current index status
+        run: wrangler vectorize get food-vectors || echo "Index doesn't exist"
+
+      - name: Delete existing index
+        run: wrangler vectorize delete food-vectors || echo "No index to delete"
+
+      - name: Wait for deletion to propagate
+        run: sleep 10
+
+      - name: Create new index
+        run: |
+          wrangler vectorize create food-vectors \
+          --dimensions 384 \
+          --metric cosine \
+          --preset "@cf/baai/bge-small-en-v1.5"
+
+      - name: Wait for index creation
+        run: sleep 10
+
+      - name: Verify new index
+        run: wrangler vectorize get food-vectors
+
+      - name: Call cleanup endpoint
+        run: |
+          curl -X POST https://black-bonus-cf17.carnivoroustoad.workers.dev/cleanup \
+          -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+          -H "Content-Type: application/json"
