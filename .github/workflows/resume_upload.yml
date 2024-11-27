@@ -29,11 +29,17 @@ jobs:
 
       - name: Create resume config
         run: |
-          echo '{
-            "current_index": 412100,
-            "failed_batches": [],
-            "timestamp": "2024-11-27T13:41:02.992Z"
-          }' > upload_progress.pkl
+          python -c "
+          import pickle
+          from datetime import datetime
+          progress = {
+              'current_index': 412100,
+              'failed_batches': [],
+              'timestamp': '2024-11-27T13:41:02.992Z'
+          }
+          with open('upload_progress.pkl', 'wb') as f:
+              pickle.dump(progress, f)
+          "
 
       - name: Verify required files
         run: |
@@ -50,7 +56,7 @@ jobs:
 
       - name: Upload progress file as artifact
         if: always()
-        uses: actions/upload-artifact@v4 # Updated to v4
+        uses: actions/upload-artifact@v4
         with:
           name: upload-progress
           path: upload_progress.pkl
