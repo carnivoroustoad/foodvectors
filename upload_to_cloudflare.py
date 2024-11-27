@@ -10,6 +10,7 @@ import signal
 import pickle
 import os
 from datetime import datetime
+from ratelimit import limits, sleep_and_retry
 
 logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,6 +26,11 @@ BATCH_SIZE = 100
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 EMBEDDING_BATCH_SIZE = 20
+VECTOR_DIMENSION = 768  # BGE base dimension
+
+# Rate limiting constants
+ONE_MINUTE = 60
+MAX_REQUESTS_PER_MINUTE = 50
 
 class GracefulExit(Exception):
     pass
@@ -90,9 +96,17 @@ class CloudflareUploader:
                 messages = result.get('messages', [])
                 raise ValueError(f"AI API error: {errors or messages}")
 
-            return np.array(result['result']['data'])
+            embeddings = np.array(result['result']['data'])
+
+            # Verify dimension
+            if embeddings.shape[1] != VECTOR_DIMENSION:
+                raise ValueError(f"Unexpected embedding dimension: got {embeddings.shape[1]}, expected {VECTOR_DIMENSION}")
+
+            return embeddings
+
         except Exception as e:
             raise ValueError(f"API request failed: {str(e)}")
+
     def load_data(self) -> Dict[str, Any]:
         """Load food data from the JSON file"""
         try:
@@ -109,19 +123,28 @@ class CloudflareUploader:
         except Exception as e:
             logger.error(f"Unexpected error loading data: {str(e)}")
             return {}
-    def create_rich_description(self, description: str, metadata: Dict) -> str:
-            """Create a rich description including brand information"""
-            brand_info = metadata.get('brand_info', {})
-            brand_name = brand_info.get('name', '').strip()
 
-            if brand_name:
-                return f"{brand_name} {description}"
-            return description
+    def create_rich_description(self, description: str, metadata: Dict) -> str:
+        """Create a rich description including brand information"""
+        brand_info = metadata.get('brand_info', {})
+        brand_name = brand_info.get('name', '').strip()
+
+        if brand_name:
+            return f"{brand_name} {description}"
+        return description
+
+    @sleep_and_retry
+    @limits(calls=MAX_REQUESTS_PER_MINUTE, period=ONE_MINUTE)
+    def rate_limited_request(self, *args, **kwargs):
+        return requests.post(*args, **kwargs)
 
     def process_batch(self,
-                        texts: List[str],
-                        metadata: List[Dict],
-                        start_idx: int) -> bool:
+                     texts: List[str],
+                     metadata: List[Dict],
+                     start_idx: int) -> bool:
+        """
+        Process a batch of texts and their metadata to create and upload vectors
+        """
         if self.stop_requested:
             raise GracefulExit("Stop requested")
 
@@ -135,6 +158,7 @@ class CloudflareUploader:
                 for text, meta in zip(texts, metadata)
             ]
 
+            # Generate embeddings in smaller sub-batches
             for i in range(0, len(rich_descriptions), EMBEDDING_BATCH_SIZE):
                 if self.stop_requested:
                     raise GracefulExit("Stop requested")
@@ -148,41 +172,94 @@ class CloudflareUploader:
                 except Exception as e:
                     logger.error(f"Failed to generate embeddings for chunk: {e}")
                     failed_indices.extend(chunk_indices)
-                    zero_embeddings = np.zeros((len(chunk), 384))
+                    # Add zero embeddings for failed items to maintain alignment
+                    zero_embeddings = np.zeros((len(chunk), VECTOR_DIMENSION))
                     embeddings.extend(zero_embeddings)
 
-                time.sleep(0.1)
+                time.sleep(0.1)  # Rate limiting
 
-            payload_vectors = []
+            # Prepare vectors for upload, excluding failed ones
+            vectors_payload = []
             for i, (embedding, meta) in enumerate(zip(embeddings, metadata)):
                 if i not in failed_indices:
-                    payload_vectors.append({
+                    # Verify vector dimension
+                    if len(embedding) != VECTOR_DIMENSION:
+                        logger.error(f"Vector dimension mismatch: got {len(embedding)}, expected {VECTOR_DIMENSION}")
+                        continue
+
+                    # Ensure description includes brand info
+                    rich_description = self.create_rich_description(texts[i], meta)
+
+                    vector_entry = {
                         'id': str(start_idx + i),
                         'values': embedding.tolist(),
-                        'metadata': meta
-                    })
+                        'metadata': {
+                            'description': rich_description,
+                            'nutrients': meta['nutrients'],
+                            'serving_info': meta.get('serving_info', {}),
+                            'brand_info': meta.get('brand_info', {}),
+                            'original_description': texts[i]
+                        }
+                    }
+                    vectors_payload.append(vector_entry)
 
-            if not payload_vectors:
+            if not vectors_payload:
                 logger.warning(f"No valid vectors in batch starting at index {start_idx}")
                 return True
 
+            # Upload vectors with retries
             for attempt in range(MAX_RETRIES):
                 if self.stop_requested:
                     raise GracefulExit("Stop requested")
 
                 try:
-                    response = requests.post(
+                    response = self.rate_limited_request(
                         f"{WORKER_URL}/upload",
-                        json={'vectors': payload_vectors},
+                        json={'vectors': vectors_payload},
                         headers=self.headers,
                         timeout=30
                     )
+
+                    if response.status_code == 413:  # Payload too large
+                        # Split batch in half and try again
+                        mid = len(vectors_payload) // 2
+                        first_half = vectors_payload[:mid]
+                        second_half = vectors_payload[mid:]
+
+                        # Upload first half
+                        response1 = self.rate_limited_request(
+                            f"{WORKER_URL}/upload",
+                            json={'vectors': first_half},
+                            headers=self.headers,
+                            timeout=30
+                        )
+                        response1.raise_for_status()
+
+                        # Upload second half
+                        response2 = self.rate_limited_request(
+                            f"{WORKER_URL}/upload",
+                            json={'vectors': second_half},
+                            headers=self.headers,
+                            timeout=30
+                        )
+                        response2.raise_for_status()
+
+                        return True
+
                     response.raise_for_status()
+
+                    result = response.json()
+                    if not result.get('success', False):
+                        raise ValueError(f"Upload failed: {result.get('error', 'Unknown error')}")
+
                     return True
-                except Exception as e:
+
+                except requests.exceptions.RequestException as e:
                     logger.error(f"Upload attempt {attempt + 1} failed: {str(e)}")
                     if attempt < MAX_RETRIES - 1:
-                        time.sleep(RETRY_DELAY * (attempt + 1))
+                        sleep_time = RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+                        logger.info(f"Retrying in {sleep_time} seconds...")
+                        time.sleep(sleep_time)
                     else:
                         logger.error(f"Failed to upload batch starting at index {start_idx}")
                         return False
@@ -194,6 +271,55 @@ class CloudflareUploader:
         except Exception as e:
             logger.error(f"Error processing batch starting at {start_idx}: {e}")
             return False
+
+    def cleanup_previous_uploads(self):
+        """Clean up all vectors from the database"""
+        try:
+            logger.info("Cleaning up previous uploads...")
+            response = requests.post(
+                f"{WORKER_URL}/cleanup",
+                headers=self.headers,
+                timeout=30
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            if result.get('success'):
+                logger.info("Successfully cleaned up previous uploads")
+                # Remove progress file if it exists
+                if os.path.exists(self.progress_file):
+                    os.remove(self.progress_file)
+            else:
+                logger.error(f"Cleanup failed: {result.get('error', 'Unknown error')}")
+
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+            raise
+
+    def validate_upload(self):
+        """Validate the upload by checking database statistics"""
+        try:
+            logger.info("Validating upload...")
+            response = requests.get(
+                f"{WORKER_URL}/stats",
+                headers=self.headers,
+                timeout=30
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            if result.get('success'):
+                stats = result.get('stats', {})
+                logger.info(f"Database statistics:")
+                logger.info(f"Total vectors: {stats.get('vectorCount', 'unknown')}")
+                logger.info(f"Dimension: {stats.get('dimensions', 'unknown')}")
+                logger.info(f"Metric: {stats.get('metric', 'unknown')}")
+            else:
+                logger.error(f"Validation failed: {result.get('error', 'Unknown error')}")
+
+        except Exception as e:
+            logger.error(f"Error during validation: {str(e)}")
+            raise
 
     def upload_to_cloudflare(self):
         try:
