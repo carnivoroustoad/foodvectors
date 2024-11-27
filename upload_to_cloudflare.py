@@ -73,7 +73,7 @@ class CloudflareUploader:
     def get_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         try:
             response = requests.post(
-                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/baai/bge-small-en-v1.5",
+                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/baai/bge-base-en-v1.5",
                 headers=self.headers,
                 json={"text": texts},
                 timeout=30
