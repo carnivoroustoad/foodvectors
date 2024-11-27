@@ -109,10 +109,19 @@ class CloudflareUploader:
         except Exception as e:
             logger.error(f"Unexpected error loading data: {str(e)}")
             return {}
+    def create_rich_description(self, description: str, metadata: Dict) -> str:
+            """Create a rich description including brand information"""
+            brand_info = metadata.get('brand_info', {})
+            brand_name = brand_info.get('name', '').strip()
+
+            if brand_name:
+                return f"{brand_name} {description}"
+            return description
+
     def process_batch(self,
-                     texts: List[str],
-                     metadata: List[Dict],
-                     start_idx: int) -> bool:
+                        texts: List[str],
+                        metadata: List[Dict],
+                        start_idx: int) -> bool:
         if self.stop_requested:
             raise GracefulExit("Stop requested")
 
@@ -120,11 +129,17 @@ class CloudflareUploader:
             embeddings = []
             failed_indices = []
 
-            for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+            # Create rich descriptions including brand information
+            rich_descriptions = [
+                self.create_rich_description(text, meta)
+                for text, meta in zip(texts, metadata)
+            ]
+
+            for i in range(0, len(rich_descriptions), EMBEDDING_BATCH_SIZE):
                 if self.stop_requested:
                     raise GracefulExit("Stop requested")
 
-                chunk = texts[i:i + EMBEDDING_BATCH_SIZE]
+                chunk = rich_descriptions[i:i + EMBEDDING_BATCH_SIZE]
                 chunk_indices = list(range(i, min(i + EMBEDDING_BATCH_SIZE, len(texts))))
 
                 try:
