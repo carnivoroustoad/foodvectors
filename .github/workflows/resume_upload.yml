@@ -1,0 +1,56 @@
+name: Resume Food Vectors Upload
+
+on:
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  resume_upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 720 # 12 hour timeout
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          lfs: true
+
+      - name: Pull LFS files
+        run: git lfs pull
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests numpy tqdm tenacity ratelimit
+
+      - name: Create resume config
+        run: |
+          echo '{
+            "current_index": 412100,
+            "failed_batches": [],
+            "timestamp": "2024-11-27T13:41:02.992Z"
+          }' > upload_progress.pkl
+
+      - name: Verify required files
+        run: |
+          echo "Checking file sizes and existence:"
+          ls -lh foods_nutrients_map.json
+          ls -l upload_to_cloudflare.py
+          ls -l upload_progress.pkl
+
+      - name: Run upload script
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          python upload_to_cloudflare.py --retry-failed
+
+      - name: Upload progress file as artifact
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: upload-progress
+          path: upload_progress.pkl
